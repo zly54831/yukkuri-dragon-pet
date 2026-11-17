@@ -1,0 +1,81 @@
+name: Pet release package audit
+on:
+  push:
+    paths:
+      - '.github/workflows/release-smoke-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect published v1.0.0 assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $repo = $env:GITHUB_REPOSITORY
+          $url = "https://api.github.com/repos/$repo/releases/tags/v1.0.0"
+          $report = [System.Collections.Generic.List[string]]::new()
+          $report.Add("# Release audit: $repo")
+          $report.Add("Version: v1.0.0")
+          $report.Add("Date (UTC): $(Get-Date -Format u)")
+          $issues = 0
+          try { $release = Invoke-RestMethod -Uri $url -Headers $headers } catch {
+            $report.Add("FAIL: v1.0.0 release not accessible: $($_.Exception.Message)")
+            $report | Set-Content -Path audit-report.md
+            exit 1
+          }
+          $assets = @($release.assets)
+          $report.Add("Assets found: $($assets.Count)")
+          if ($assets.Count -eq 0) { $report.Add('FAIL: no release assets'); $issues++ }
+          New-Item -ItemType Directory -Force -Path downloaded | Out-Null
+          foreach ($asset in $assets) {
+            $name = [string]$asset.name
+            $report.Add("- $name ($($asset.size) bytes)")
+            if ($asset.size -le 0) { $report.Add("  FAIL: empty asset"); $issues++; continue }
+            if ($name -notmatch '\.(zip|tar\.gz|tgz)$') { continue }
+            $target = Join-Path downloaded $name
+            try {
+              Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $target
+              $size = (Get-Item $target).Length
+              if ($size -ne $asset.size) { throw "size mismatch $size vs $($asset.size)" }
+              $hash = (Get-FileHash -Path $target -Algorithm SHA256).Hash
+              $report.Add("  Download OK; SHA256: $hash")
+              $out = Join-Path downloaded ([IO.Path]::GetFileNameWithoutExtension($name) -replace '[^a-zA-Z0-9_-]','_')
+              New-Item -ItemType Directory -Force -Path $out | Out-Null
+              if ($name -match '\.zip$') { Expand-Archive -LiteralPath $target -DestinationPath $out -Force }
+              else { tar -xzf $target -C $out; if ($LASTEXITCODE -ne 0) { throw 'tar extraction failed' } }
+              $entries = @(Get-ChildItem -LiteralPath $out -Recurse -File)
+              $report.Add("  Extract OK; files: $($entries.Count)")
+              if ($entries.Count -eq 0) { $report.Add('  FAIL: archive has no files'); $issues++ }
+              $entry = @($entries | Where-Object { $_.Extension -in '.exe','.py','.bat','.cmd','.ps1' })
+              $report.Add("  Possible launch files: $($entry.Count)")
+              foreach ($e in ($entry | Select-Object -First 12)) { $report.Add("    $($e.FullName.Substring($out.Length+1))") }
+              if ($entry.Count -eq 0) { $report.Add('  WARN: no obvious launch entry (may be source-only archive)') }
+            } catch {
+              $report.Add("  FAIL: $($_.Exception.Message)")
+              $issues++
+            }
+          }
+          if (@($assets | Where-Object { $_.name -match '\.(zip|tar\.gz|tgz)$' }).Count -eq 0) {
+            $report.Add('FAIL: no downloadable zip/tar.gz package')
+            $issues++
+          }
+          $report.Add("Blocking issues: $issues")
+          $report | Set-Content -Path audit-report.md -Encoding utf8
+          Get-Content audit-report.md
+          if ($issues -gt 0) { exit 1 }
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-audit
+          path: audit-report.md
+          if-no-files-found: warn
